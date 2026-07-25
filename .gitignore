@@ -1,0 +1,20 @@
+# PyCharm 配置
+.idea/
+
+# Python 缓存
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 模型权重和训练输出
+*.pth
+*.pt
+*.safetensors
+checkpoints/
+out/
+outputs/
+
+# 两个超大数据集
+do_it/dataset/pretrain_t2t_mini.jsonl
+do_it/dataset/sft_t2t_mini.jsonl

@@ -1,0 +1,26 @@
+import torch
+from torch.utils.data import Dataset
+from datasets import load_dataset
+
+class PretrainDataset(Dataset):
+    def __init__(self,train_path,tokenizer,max_seq_len):
+        super().__init__()
+        self.samples = load_dataset("json",data_files=train_path,split="train")
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+    def __len__(self):
+        return len(self.samples)
+    def __getitem__(self,index):
+        sample = self.samples[index]
+        text = str(sample['text'])
+        input_ids = self.tokenizer.encode(
+            text=text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_seq_len-2)
+        input_ids = [self.tokenizer.bos_token_id] + input_ids + [self.tokenizer.eos_token_id]
+        input_ids = input_ids + [self.tokenizer.pad_token_id]*(self.max_seq_len-len(input_ids))
+        input_ids = torch.tensor(input_ids,dtype=torch.long)
+        labels = input_ids.clone()
+        labels[labels==self.tokenizer.pad_token_id] = -100
+        return input_ids, labels
