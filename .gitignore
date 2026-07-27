@@ -12,12 +12,14 @@ venv/
 *.pt
 *.safetensors
 checkpoints/
+checkpoint/
 out/
 outputs/
 
 # 两个超大数据集
 do_it/dataset/pretrain_t2t_mini.jsonl
 do_it/dataset/sft_t2t_mini.jsonl
+do_it_by_your_own/data/
 
 # Upstream reference repository (kept locally only)
 warehouse/

@@ -32,7 +32,7 @@ class MinimindForCausalLM(nn.Module):
         self.model = MinimindModel(vocab_size,max_seq_len,d_model,dropout,
                  nhead,dim_feedforward,num_layers)
         self.lm_head = nn.Linear(d_model,vocab_size)
-        self.lm_head.weight = self.model.embedding.weight
+        self.lm_head.weight = self.model.embeddings.weight
     def forward(self,input_ids,labels=None):
         x = self.model(input_ids)
         logits = self.lm_head(x)
@@ -44,24 +44,42 @@ class MinimindForCausalLM(nn.Module):
             shift_lables = shift_lables.reshape(-1)
             loss = F.cross_entropy(shift_logits,shift_lables)
         return logits,loss
-    def generate(self):
+    def generate(self,batch_size,device,max_new_tokens,input_ids,repetition_penalty,temperature,topk,top_p,do_sample,eos_token_id):
         with torch.no_grad():
-            finished = torch.zeros(1,batch_size,device=device)
-            for _ in max_new_tokens:
-                logits,loss = self.model(input_ids,None)
+            finished = torch.zeros(batch_size,dtype=bool,device=device)
+            for _ in range(max_new_tokens):
+                logits,loss = self(input_ids,labels=None)
                 logits = logits[:,-1,:]
-                repeated_scores = torch.gather(logits,dim=1,index=imput_ids)
+                repeated_scores = torch.gather(logits,dim=1,index=input_ids)
                 repeated_scores = torch.where(repeated_scores<0,repeated_scores*repetition_penalty,repeated_scores/repetition_penalty)
-                logits.scatter(dim=1,index=input_ids,src=repeated_scores)
-                next_token = next_token / temperature
-                topk_values,topk_indices = torch.topk(logits,k=3,dim=1)
+                logits.scatter_(dim=1,index=input_ids,src=repeated_scores)
+                logits = logits / temperature
+                topk_values,topk_indices = torch.topk(logits,k=topk,dim=1)
                 filtered_logits = torch.full_like(logits,float("-inf"))
-                filtered_logits.scatter(dim=1,index=topk_indices,src=topk_values)
+                filtered_logits.scatter_(dim=1,index=topk_indices,src=topk_values)
                 logits = filtered_logits
-                sort_logits,sort_indices = torch.sort(logits,dim=1,descending=True)
-                sort_logits = torch.softmax(sort_logits,dim=1)
-                cumulative_logits = torch.cumsum(sort_logits,dim=1)
-                
+                sorted_logits,sorted_indices = torch.sort(logits,dim=1,descending=True)
+                sorted_probs = torch.softmax(sorted_logits,dim=1)
+                cumulative_probs = torch.cumsum(sorted_probs,dim=1)
+                sorted_indices_to_remove = (cumulative_probs > top_p)
+                sorted_indices_to_remove[...,1:] = sorted_indices_to_remove[...,:-1].clone()
+                sorted_indices_to_remove[...,0] = False
+                sorted_logits = sorted_logits.masked_fill(sorted_indices_to_remove,float("-inf"))
+                logits.scatter_(dim=1,index=sorted_indices,src=sorted_logits)
+                probs = torch.softmax(logits,dim=1)
+                if do_sample:
+                    next_token = torch.multinomial(probs,num_samples=1)
+                else:
+                    next_token = torch.argmax(probs,dim=1,keepdim=True)
+                next_token = torch.where(finished.unsqueeze(1),torch.full_like(next_token,eos_token_id),next_token)
+                input_ids = torch.cat([input_ids,next_token],dim=1)
+                next_token = next_token.squeeze(-1)
+                is_eos = torch.where(next_token==eos_token_id,True,False)
+                finished = finished|is_eos
+                if finished.all():
+                    break
+            return input_ids
+
 
 
 # Minimind = MinimindForCausalLM(100,100,

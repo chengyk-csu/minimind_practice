@@ -18,7 +18,8 @@ class PretrainDataset(Dataset):
             add_special_tokens=False,
             truncation=True,
             max_length=self.max_seq_len-2)
-        input_ids = [self.tokenizer.bos_token_id] + input_ids + [self.tokenizer.eos_token_id]
+        #input_ids = [self.tokenizer.bos_token_id] + input_ids + [self.tokenizer.eos_token_id]
+        input_ids = input_ids + [self.tokenizer.eos_token_id]
         input_ids = input_ids + [self.tokenizer.pad_token_id]*(self.max_seq_len-len(input_ids))
         input_ids = torch.tensor(input_ids,dtype=torch.long)
         labels = input_ids.clone()
