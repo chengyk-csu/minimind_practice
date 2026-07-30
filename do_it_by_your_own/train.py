@@ -11,7 +11,8 @@ def train_epoch(train_loader,device,model,optimizer):
     for batch_idx,(input_ids,labels) in enumerate(train_loader):
         input_ids = input_ids.to(device)
         labels = labels.to(device)
-        logits,loss = model(input_ids,labels)
+        outputs = model(input_ids,labels=labels)
+        loss = outputs.loss
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
@@ -30,7 +31,6 @@ if __name__ =="__main__":
     #     train_epoch(train_loader,device,model,optimizer)
     #     os.makedirs("checkpoint",exist_ok=True)
     #     torch.save(model.state_dict(),f"checkpoint/model_epoch{epoch}.pth")
-
     checkpoint_path = "./checkpoint/model_epoch99.pth"
 
     state_dict = torch.load(checkpoint_path,map_location=device, weights_only=True)
