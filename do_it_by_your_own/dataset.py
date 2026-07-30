@@ -1,13 +1,14 @@
 import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset
+from model import MiniMindConfig
 
 class PretrainDataset(Dataset):
-    def __init__(self,train_path,tokenizer,max_seq_len):
+    def __init__(self,train_path,tokenizer,config: MiniMindConfig):
         super().__init__()
         self.samples = load_dataset("json",data_files=train_path,split="train")
         self.tokenizer = tokenizer
-        self.max_seq_len = max_seq_len
+        self.max_seq_len = config.max_seq_len
     def __len__(self):
         return len(self.samples)
     def __getitem__(self,index):
@@ -22,6 +23,7 @@ class PretrainDataset(Dataset):
         input_ids = input_ids + [self.tokenizer.eos_token_id]
         input_ids = input_ids + [self.tokenizer.pad_token_id]*(self.max_seq_len-len(input_ids))
         input_ids = torch.tensor(input_ids,dtype=torch.long)
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
         labels = input_ids.clone()
         labels[labels==self.tokenizer.pad_token_id] = -100
-        return input_ids, labels
+        return input_ids,attention_mask, labels
