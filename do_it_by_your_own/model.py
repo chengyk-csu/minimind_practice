@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from transformers import PretrainedConfig
 import math
 from transformers.activations import ACT2FN
@@ -43,12 +43,30 @@ class MiniMindConfig(PretrainedConfig):
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
 
-def precompute_freqs_cis(head_dim, max_seq_len, theta=1e6):
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-    positions = torch.arange(max_seq_len).float()
+def precompute_freqs_cis(head_dim,max_seq_len,theta=1e6,rope_scaling=None):
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float()/ head_dim))
+    attention_factor = 1.0
+    if rope_scaling is not None:
+        original_max_seq_len = rope_scaling.get("original_max_position_embeddings",2048)
+        factor = rope_scaling.get("factor", 16)
+        beta_fast = rope_scaling.get("beta_fast", 32.0)
+        beta_slow = rope_scaling.get("beta_slow", 1.0)
+        attention_factor = rope_scaling.get("attention_factor",1.0)
+        if max_seq_len / original_max_seq_len > 1.0:
+            def find_correction_dim(beta):
+                return (head_dim* math.log(original_max_seq_len/ (beta * 2 * math.pi))/ (2 * math.log(theta)))
+            low = max(math.floor(find_correction_dim(beta_fast)),0)
+            high = min(math.ceil(find_correction_dim(beta_slow)),head_dim // 2 - 1)
+            ramp = torch.clamp(
+                (torch.arange(head_dim // 2,device=inv_freq.device).float()- low)/ max(high - low, 0.001),
+                min=0,
+                max=1
+            )
+            inv_freq = inv_freq * (1 - ramp + ramp / factor)
+    positions = torch.arange(max_seq_len,device=inv_freq.device).float()
     freqs = torch.outer(positions, inv_freq)
-    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)],dim=-1)
-    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)],dim=-1)
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)],dim=-1) * attention_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)],dim=-1) * attention_factor
     return freqs_cos, freqs_sin
 
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -64,6 +82,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 class Attention(nn.Module):
     def __init__(self, config:MiniMindConfig):
         super().__init__()
+        self.flash_attn = config.flash_attn
         assert config.d_model % config.num_heads == 0
         assert config.num_heads % config.num_kv_heads == 0
         self.num_heads = config.num_heads
@@ -97,22 +116,26 @@ class Attention(nn.Module):
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            key_padding_mask = None
-            if attention_mask is not None:
-                key_padding_mask = attention_mask[:, None, None, :].to(
-                    device=q.device,
-                    dtype=torch.bool
-                )
-            query_len = q.size(-2)
-            key_len = k.size(-2)
-            past_len = key_len - query_len
-            query_positions = (torch.arange(query_len, device=q.device)+past_len)
-            key_positions = torch.arange(key_len,device=q.device)
-            causal_mask = (key_positions.unsqueeze(0) <= query_positions.unsqueeze(1))
-            attn_mask = causal_mask[None, None, :, :]
-            if key_padding_mask is not None:
-                attn_mask = attn_mask & key_padding_mask
-            attn_output = F.scaled_dot_product_attention(q,k,v,dropout_p=self.dropout if self.training else 0.0,attn_mask=attn_mask,enable_gqa=True)
+            can_use_fast_path = (self.flash_attn and past_key_value is None and (attention_mask is None or torch.all(attention_mask == 1)))
+            if can_use_fast_path:
+                attn_output = F.scaled_dot_product_attention(q,k,v,attn_mask=None,dropout_p=self.dropout if self.training else 0.0,is_causal=True,enable_gqa=True)
+            else:
+                key_padding_mask = None
+                if attention_mask is not None:
+                    key_padding_mask = attention_mask[:, None, None, :].to(
+                        device=q.device,
+                        dtype=torch.bool
+                    )
+                query_len = q.size(-2)
+                key_len = k.size(-2)
+                past_len = key_len - query_len
+                query_positions = (torch.arange(query_len, device=q.device)+past_len)
+                key_positions = torch.arange(key_len,device=q.device)
+                causal_mask = (key_positions.unsqueeze(0) <= query_positions.unsqueeze(1))
+                attn_mask = causal_mask[None, None, :, :]
+                if key_padding_mask is not None:
+                    attn_mask = attn_mask & key_padding_mask
+                attn_output = F.scaled_dot_product_attention(q,k,v,dropout_p=self.dropout if self.training else 0.0,attn_mask=attn_mask,enable_gqa=True)
             attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len,self.num_heads * self.head_dim)
             attn_output = self.o_proj(attn_output)
             attn_output = self.resid_dropout(attn_output)
@@ -121,7 +144,8 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig,dim_feedforward=None):
         super().__init__()
-        intermediate_size = (dim_feedforward if dim_feedforward is not None else config.intermediate_size)
+        # 修复：Config 中的 FFN 宽度字段名是 dim_feedforward。
+        intermediate_size = (dim_feedforward if dim_feedforward is not None else config.dim_feedforward)
         self.gate_proj = nn.Linear(config.d_model,intermediate_size,bias=False)
         self.up_proj = nn.Linear(config.d_model,intermediate_size,bias=False)
         self.down_proj = nn.Linear(intermediate_size,config.d_model,bias=False)
@@ -158,6 +182,8 @@ class MOEFeedForward(nn.Module):
         for expert_id, expert in enumerate(self.experts):
             expert_mask = topk_indices == expert_id
             if not expert_mask.any():
+                if self.training:
+                    output[0, 0] += (0 * sum(p.sum() for p in expert.parameters()))
                 continue
             token_indices = (
                 expert_mask.any(dim=-1)
@@ -206,7 +232,8 @@ class MinimindModel(nn.Module):
             for layer_id in range(config.num_layers)
         ])
         head_dim = config.d_model // config.num_heads
-        freqs_cos, freqs_sin = precompute_freqs_cis(head_dim=head_dim,max_seq_len=config.max_seq_len,theta=config.rope_theta)
+        # 修复：将 Config 中的 YaRN/RoPE scaling 配置传入预计算函数。
+        freqs_cos, freqs_sin = precompute_freqs_cis(head_dim=head_dim,max_seq_len=config.max_seq_len,theta=config.rope_theta,rope_scaling=config.rope_scaling)
         self.register_buffer("freqs_cos",freqs_cos,persistent=False)
         self.register_buffer("freqs_sin",freqs_sin,persistent=False)
         self.norm = nn.RMSNorm(config.d_model,eps=config.rms_norm_eps)
@@ -251,9 +278,13 @@ class MinimindForCausalLM(PreTrainedModel, GenerationMixin):
         return self.lm_head
     def set_output_embeddings(self, value):
         self.lm_head = value
-    def forward(self,input_ids,attention_mask=None,labels=None,past_key_values=None,use_cache=False):
+    def forward(self,input_ids,attention_mask=None,labels=None,past_key_values=None,use_cache=False,logits_to_keep=0):
         x, presents,aux_loss = self.model(input_ids,attention_mask=attention_mask,past_key_values=past_key_values,use_cache=use_cache)
-        logits = self.lm_head(x)
+        if logits_to_keep == 0:
+            hidden_for_logits = x
+        else:
+            hidden_for_logits = x[:, -logits_to_keep:, :]
+        logits = self.lm_head(hidden_for_logits)
         loss = None
         if labels is not None:
             shift_logits = logits[:,:-1,:]
@@ -261,7 +292,8 @@ class MinimindForCausalLM(PreTrainedModel, GenerationMixin):
             shift_logits = shift_logits.reshape(-1,shift_logits.shape[-1])
             shift_lables = shift_lables.reshape(-1)
             loss = F.cross_entropy(shift_logits,shift_lables)
-        return CausalLMOutputWithPast(loss=loss,aux_loss=aux_loss,logits=logits,past_key_values=tuple(presents) if use_cache else None)
+        # 修复：使用支持 aux_loss 字段的 Transformers 标准 MoE 输出类。
+        return MoeCausalLMOutputWithPast(loss=loss,aux_loss=aux_loss,logits=logits,past_key_values=tuple(presents) if use_cache else None)
     def generate(self,batch_size,device,max_new_tokens,input_ids, repetition_penalty,temperature,topk,top_p,do_sample,eos_token_id, attention_mask=None):
         with torch.no_grad():
             if attention_mask is None:
@@ -271,7 +303,7 @@ class MinimindForCausalLM(PreTrainedModel, GenerationMixin):
             for _ in range(max_new_tokens):
                 past_len = (past_key_values[0][0].shape[1]if past_key_values is not None else 0)
                 model_input_ids = input_ids[:, past_len:]
-                outputs = self.forward(input_ids=model_input_ids,attention_mask=attention_mask,past_key_values=past_key_values,use_cache=True)
+                outputs = self.forward(input_ids=model_input_ids,attention_mask=attention_mask,past_key_values=past_key_values,use_cache=True,logits_to_keep=1)
                 logits = outputs.logits[:, -1, :]
                 repeated_scores = torch.gather(logits,dim=1,index=input_ids)
                 repeated_scores = torch.where(repeated_scores<0,repeated_scores*repetition_penalty,repeated_scores/repetition_penalty)
