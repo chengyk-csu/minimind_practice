@@ -5,6 +5,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import PretrainedConfig
 import math
 from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -118,9 +119,9 @@ class Attention(nn.Module):
             return attn_output, present_key_value
 
 class FeedForward(nn.Module):
-    def __init__(self, config: MiniMindConfig, intermediate_size=None):
+    def __init__(self, config: MiniMindConfig,dim_feedforward=None):
         super().__init__()
-        intermediate_size = intermediate_size or config.dim_feedforward
+        intermediate_size = (dim_feedforward if dim_feedforward is not None else config.intermediate_size)
         self.gate_proj = nn.Linear(config.d_model,intermediate_size,bias=False)
         self.up_proj = nn.Linear(config.d_model,intermediate_size,bias=False)
         self.down_proj = nn.Linear(intermediate_size,config.d_model,bias=False)
@@ -132,13 +133,58 @@ class FeedForward(nn.Module):
         output = self.down_proj(hidden_states)
         return output
 
+class MOEFeedForward(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.gate = nn.Linear(config.d_model,config.num_experts,bias=False)
+        self.experts = nn.ModuleList([
+            FeedForward(config,config.moe_intermediate_size)
+            for _ in range(config.num_experts)
+        ])
+    def _route_tokens(self, x):
+        batch_size, seq_len, d_model = x.shape
+        x_flat = x.reshape(batch_size * seq_len,d_model)
+        router_logits = self.gate(x_flat)
+        routing_probs = F.softmax(router_logits,dim=-1,dtype=torch.float32)
+        topk_weights, topk_indices = torch.topk(routing_probs,k=self.config.num_experts_per_tok,dim=-1)
+        if self.config.norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1,keepdim=True)
+        topk_weights = topk_weights.to(x.dtype)
+        return (x_flat,routing_probs,topk_indices,topk_weights,(batch_size, seq_len, d_model))
+    def forward(self, x):
+        (x_flat,routing_probs,topk_indices,topk_weights,original_shape) = self._route_tokens(x)
+        output = torch.zeros_like(x_flat)
+        for expert_id, expert in enumerate(self.experts):
+            expert_mask = topk_indices == expert_id
+            if not expert_mask.any():
+                continue
+            token_indices = (
+                expert_mask.any(dim=-1)
+                .nonzero(as_tuple=False)
+                .flatten()
+            )
+            expert_input = x_flat[token_indices]
+            expert_output = expert(expert_input)
+            expert_weights = topk_weights[expert_mask].unsqueeze(-1)
+            weighted_output = expert_output * expert_weights
+            output.index_add_(dim=0,index=token_indices,source=weighted_output.to(output.dtype))
+        if self.training and self.config.router_aux_loss_coef > 0:
+            load = F.one_hot(topk_indices,num_classes=self.config.num_experts).float().mean(dim=0)
+            mean_routing_probs = routing_probs.mean(dim=0)
+            self.aux_loss = ((load * mean_routing_probs).sum() * self.config.num_experts * self.config.router_aux_loss_coef)
+        else:
+            self.aux_loss = routing_probs.new_zeros(1).squeeze()
+        batch_size, seq_len, d_model = original_shape
+        return output.reshape(batch_size,seq_len,d_model)
+
 class MiniMindBlock(nn.Module):
     def __init__(self,layer_id:int,config: MiniMindConfig):
         super().__init__()
         self.self_attn = Attention(config)
         self.input_layernorm = nn.RMSNorm(config.d_model,eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.d_model,eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config,intermediate_size=config.dim_feedforward)
+        self.mlp = MOEFeedForward(config) if config.use_moe else FeedForward(config)
     def forward(self, hidden_states, position_embeddings,past_key_value=None,use_cache=False,attention_mask=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -183,17 +229,30 @@ class MinimindModel(nn.Module):
             )
             presents.append(present_key_value)
         x = self.norm(x)
-        return x,presents
+        aux_loss = x.new_zeros(())
+        for layer in self.layers:
+            if isinstance(layer.mlp, MOEFeedForward):
+                aux_loss = aux_loss + layer.mlp.aux_loss
+        return x,presents,aux_loss
 
-class MinimindForCausalLM(nn.Module):
+class MinimindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+    _tied_weights_keys = ["lm_head.weight"]
     def __init__(self,config: MiniMindConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.model = MinimindModel(config)
         self.lm_head = nn.Linear(config.d_model,config.vocab_size,bias=False)
-        self.lm_head.weight = self.model.embeddings.weight
-    def forward(self,input_ids,attention_mask,labels=None,past_key_values=None,use_cache=False):
-        x, presents = self.model(input_ids,attention_mask=attention_mask,past_key_values=past_key_values,use_cache=use_cache)
+        self.post_init()
+    def get_input_embeddings(self):
+        return self.model.embeddings
+    def set_input_embeddings(self, value):
+        self.model.embeddings = value
+    def get_output_embeddings(self):
+        return self.lm_head
+    def set_output_embeddings(self, value):
+        self.lm_head = value
+    def forward(self,input_ids,attention_mask=None,labels=None,past_key_values=None,use_cache=False):
+        x, presents,aux_loss = self.model(input_ids,attention_mask=attention_mask,past_key_values=past_key_values,use_cache=use_cache)
         logits = self.lm_head(x)
         loss = None
         if labels is not None:
@@ -202,7 +261,7 @@ class MinimindForCausalLM(nn.Module):
             shift_logits = shift_logits.reshape(-1,shift_logits.shape[-1])
             shift_lables = shift_lables.reshape(-1)
             loss = F.cross_entropy(shift_logits,shift_lables)
-        return CausalLMOutputWithPast(loss=loss,logits=logits,past_key_values=tuple(presents) if use_cache else None)
+        return CausalLMOutputWithPast(loss=loss,aux_loss=aux_loss,logits=logits,past_key_values=tuple(presents) if use_cache else None)
     def generate(self,batch_size,device,max_new_tokens,input_ids, repetition_penalty,temperature,topk,top_p,do_sample,eos_token_id, attention_mask=None):
         with torch.no_grad():
             if attention_mask is None:
