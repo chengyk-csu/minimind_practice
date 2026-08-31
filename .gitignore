@@ -23,3 +23,6 @@ do_it_by_your_own/data/
 
 # Upstream reference repository (kept locally only)
 warehouse/
+
+# Original MiniMind source kept locally only; never publish it in this repository
+do_it/
